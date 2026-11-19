@@ -66,7 +66,7 @@ struct ShortcutActionEnvironment {
     var activate: (ShortcutTarget) -> Bool
     var hasPermission: () -> Bool
     var requestPermission: () -> Void
-    var post: (ShortcutTarget) -> Bool
+    var postToSession: () -> Bool
     var schedule: (TimeInterval, @escaping () -> Void) -> Void
 
     static var live: ShortcutActionEnvironment {
@@ -86,10 +86,11 @@ struct ShortcutActionEnvironment {
                 // Request the same capability that hasPermission checks.
                 _ = CGRequestPostEventAccess()
             },
-            post: { target in
+            postToSession: {
                 guard let events = ShortcutActionService.makeGoToFolderEvents() else { return false }
-                // Never post globally: a focus change must not redirect the keys.
-                for event in events { event.postToPid(target.processIdentifier) }
+                // macOS routes keyboard input to the focused window, including
+                // Open and Save panels hosted outside the foreground app's process.
+                for event in events { event.post(tap: .cgSessionEventTap) }
                 return true
             },
             schedule: { delay, action in
@@ -164,10 +165,10 @@ final class ShortcutActionService {
     private func sendWhenFocused(_ target: ShortcutTarget, remainingAttempts: Int,
                                  completion: @escaping (Result<Void, ShortcutActionError>) -> Void) {
         guard environment.isRunning(target) else { completion(.failure(.targetUnavailable)); return }
+        guard environment.hasPermission() else { completion(.failure(.accessibilityPermissionRequired)); return }
         let frontmost = environment.frontmost()
         if frontmost?.isSameProcess(as: target) == true {
-            guard environment.hasPermission() else { completion(.failure(.accessibilityPermissionRequired)); return }
-            completion(environment.post(target) ? .success(()) : .failure(.eventCreationFailed))
+            completion(environment.postToSession() ? .success(()) : .failure(.eventCreationFailed))
         } else if let frontmost, frontmost.processIdentifier != environment.ownPID {
             completion(.failure(.targetChanged))
         } else if remainingAttempts > 0 {

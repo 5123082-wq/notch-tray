@@ -4,7 +4,7 @@
 
 Перетащите файлы к чёлке Mac, переключитесь в другое приложение и заберите их с полки. Notch Tray также собирает скриншоты и позволяет добавлять к ним стрелки, фигуры и текст.
 
-**Apple Silicon · macOS 14 и новее · интерфейс на русском**
+**Версия 0.4.13 · Apple Silicon · macOS 14 и новее · интерфейс на русском**
 
 [Скачать для Mac (.dmg)](https://github.com/5123082-wq/notch-tray/releases/latest/download/Notch-Tray-arm64.dmg) · [Сайт](https://notch-tray.fast-cove-4110.chatgpt.site/) · [Что нового](https://github.com/5123082-wq/notch-tray/releases/latest)
 

@@ -4,7 +4,7 @@
 
 Drag files to the notch at the top of your Mac screen, switch to another app, then drag them out. Notch Tray also collects screenshots and lets you mark them up with arrows, shapes and text.
 
-**Apple Silicon · macOS 14 or later · Russian interface**
+**Version 0.4.13 · Apple Silicon · macOS 14 or later · Russian interface**
 
 [Download for Mac (.dmg)](https://github.com/5123082-wq/notch-tray/releases/latest/download/Notch-Tray-arm64.dmg) · [Website](https://notch-tray.fast-cove-4110.chatgpt.site/) · [Release notes](https://github.com/5123082-wq/notch-tray/releases/latest)
 

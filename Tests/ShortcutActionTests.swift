@@ -14,6 +14,7 @@ private final class ShortcutHarness {
     var activations: [pid_t] = []
     var posted: [pid_t] = []
     var permissionRequests = 0
+    var onPermissionCheck: (() -> Void)?
     var scheduled: [() -> Void] = []
 
     init() {
@@ -27,9 +28,15 @@ private final class ShortcutHarness {
             frontmost: { self.frontmost },
             isRunning: { target in self.running[target.processIdentifier]?.isSameProcess(as: target) == true },
             activate: { target in self.activations.append(target.processIdentifier); return self.activationSucceeds },
-            hasPermission: { self.allowed },
+            hasPermission: {
+                self.onPermissionCheck?()
+                return self.allowed
+            },
             requestPermission: { self.permissionRequests += 1 },
-            post: { target in self.posted.append(target.processIdentifier); return self.postSucceeds },
+            postToSession: {
+                self.posted.append(self.frontmost?.processIdentifier ?? 0)
+                return self.postSucceeds
+            },
             schedule: { _, action in self.scheduled.append(action) }
         ), observeActivations: false)
     }
@@ -103,6 +110,17 @@ struct ShortcutActionTests {
             h.drain()
             failure(result, .targetChanged)
             precondition(h.posted.isEmpty && h.activations.isEmpty, "Do not steal focus or redirect a stale action")
+            checks += 1
+        }
+        do {
+            let h = ShortcutHarness(), service = h.service()
+            let action = try service.prepareGoToFolder().get()
+            var result: Result<Void, ShortcutActionError>?
+            service.send(action) { result = $0 }
+            h.onPermissionCheck = { [unowned h] in h.frontmost = h.other }
+            h.drain()
+            failure(result, .targetChanged)
+            precondition(h.posted.isEmpty, "Check focus after the permission check before posting to the session")
             checks += 1
         }
         do {
