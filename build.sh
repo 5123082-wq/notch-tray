@@ -15,7 +15,8 @@ xcrun swiftc -swift-version 5 -O -target "$ARCH-apple-macosx14.0" \
   -framework AppKit -framework QuartzCore -framework QuickLookThumbnailing \
   "$PROJECT_DIR"/Sources/*.swift -o "$OUTPUT_APP/Contents/MacOS/NotchTray"
 cp "$PROJECT_DIR/Info.plist" "$OUTPUT_APP/Contents/Info.plist"
-for file in README.md THIRD_PARTY_NOTICES.md LICENSE; do
+cp "$PROJECT_DIR/docs/guide.ru.md" "$OUTPUT_APP/Contents/Resources/README.md"
+for file in THIRD_PARTY_NOTICES.md LICENSE; do
   if [ -f "$PROJECT_DIR/$file" ]; then cp "$PROJECT_DIR/$file" "$OUTPUT_APP/Contents/Resources/"; fi
 done
 cp -R "$PROJECT_DIR/Licenses" "$OUTPUT_APP/Contents/Resources/"
