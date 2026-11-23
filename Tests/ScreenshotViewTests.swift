@@ -65,6 +65,7 @@ struct ScreenshotViewTests {
 
         check(c.view.filesButton.state == .on && c.view.screenshotsButton.state == .off,
               "initial section buttons identify Files without opening screenshots")
+        check(!c.view.addButton.isHidden, "Files still offers manual adding")
         check(c.view.screenshotsButton.title == "12", "camera displays the screenshot count while Files is active")
         check(c.view.screenshotsButton.accessibilityLabel() == "Скриншоты, 12",
               "camera exposes its collection and count to accessibility")
@@ -114,8 +115,19 @@ struct ScreenshotViewTests {
               "new snapshot updates camera count while preserving selection")
         check(c.view.tiles.filter { !$0.removeButton.isHidden }.count <= 1,
               "section changes and reloads retain a single hover owner")
-        check(!c.view.subtitle.stringValue.isEmpty && c.view.subtitle.toolTip == c.screenshotStatusText,
-              "screenshot source status is available with its full tooltip")
+        check(c.view.subtitle.stringValue.isEmpty && c.view.subtitle.toolTip == nil && c.view.addButton.isHidden,
+              "Screenshots has no static path label or manual add button")
+        let settings = c.screenshotSettingsMenuItem().submenu!
+        check(settings.items.contains { $0.title.hasPrefix("Папка: ") } &&
+              settings.items.contains { $0.title == "Показать папку в Finder" },
+              "The screenshot folder and Finder command remain in settings")
+        var preferences = c.screenshotSettings
+        preferences.automaticImport = false
+        try c.saveScreenshotSettings(preferences)
+        check(c.view.subtitle.stringValue == "Автоматическое добавление выключено",
+              "Screenshots reports disabled automatic importing")
+        preferences.automaticImport = true
+        try c.saveScreenshotSettings(preferences)
 
         c.isDraggingOut = true
         check(!c.view.filesButton.isEnabled && !c.view.screenshotsButton.isEnabled,
@@ -142,6 +154,7 @@ struct ScreenshotViewTests {
         c.view.layoutSubtreeIfNeeded()
         check(c.view.tiles.count == files.count && c.selection == [files[6].id],
               "clearing screenshots leaves ordinary file cards and selection intact")
+        check(!c.view.addButton.isHidden, "Switching back restores the Files add button")
         check(c.view.scroll.contentView.bounds.origin.y == fileScroll,
               "clearing screenshots leaves ordinary file scrolling intact")
         c.isExpanded = false

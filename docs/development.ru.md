@@ -2,7 +2,7 @@
 
 ## Сборка из исходников
 
-Нужны актуальные Command Line Tools с Swift или Xcode. Выпуск 0.4.13 собран с SDK macOS 27.2.
+Нужны актуальные Command Line Tools с Swift или Xcode. Выпуск 0.4.14 собран с SDK macOS 27.2.
 Команда `security find-identity -v -p codesigning` показывает доступные сертификаты.
 В Terminal из корня репозитория укажите отпечаток своего сертификата:
 

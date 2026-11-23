@@ -62,7 +62,7 @@ final class TrayController: NSObject {
     var screenshotStatusText: String {
         if !screenshotSettings.automaticImport { return "Автоматическое добавление выключено" }
         if let issue = screenshotMonitorStatus?.issue { return issue }
-        return "Папка: \(screenshotFolder.path)"
+        return ""
     }
     var selection = Set<UUID>()
     var anchor: UUID?

@@ -15,6 +15,7 @@ enum ImageEditError: LocalizedError {
 }
 
 struct EditableImage {
+    private static let maximumPixels = 80_000_000
     let image: CGImage
     var bounds: CGRect { CGRect(x: 0, y: 0, width: image.width, height: image.height) }
 
@@ -30,7 +31,7 @@ struct EditableImage {
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
               let height = properties[kCGImagePropertyPixelHeight] as? Int,
               width > 0, height > 0 else { throw ImageEditError.unsupported }
-        guard width <= 80_000_000 / height else { throw ImageEditError.tooLarge }
+        guard width <= Self.maximumPixels / height else { throw ImageEditError.tooLarge }
         // ImageIO applies EXIF orientation at the original pixel resolution.
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -42,12 +43,17 @@ struct EditableImage {
     }
 
     func png(annotations: [ImageAnnotation]) throws -> Data {
-        guard let context = CGContext(data: nil, width: image.width, height: image.height,
+        let artboard = AnnotationArtboard.bounds(for: bounds, annotations: annotations)
+        guard artboard.height <= CGFloat(Self.maximumPixels),
+              artboard.width <= CGFloat(Self.maximumPixels / Int(artboard.height)) else { throw ImageEditError.tooLarge }
+        guard let context = CGContext(data: nil, width: Int(artboard.width), height: Int(artboard.height),
             bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw ImageEditError.renderFailed }
-        context.draw(image, in: bounds)
-        context.translateBy(x: 0, y: bounds.height)
+        context.draw(image, in: CGRect(x: -artboard.minX, y: artboard.maxY - bounds.height,
+                                       width: bounds.width, height: bounds.height))
+        context.translateBy(x: -artboard.minX, y: artboard.maxY)
         context.scaleBy(x: 1, y: -1)
+        AnnotationArtboard.drawPadding(in: context, source: bounds, artboard: artboard)
         for annotation in annotations { annotation.draw(in: context) }
         guard let rendered = context.makeImage() else { throw ImageEditError.renderFailed }
         let data = NSMutableData()
@@ -80,10 +86,15 @@ private final class ImageEditorScrollView: NSScrollView {
         hasVerticalScroller = true
         scrollerStyle = .overlay
         autohidesScrollers = true
-        let surface = NSView()
+        let surface = FlippedView()
         surface.addSubview(imageView)
         surface.addSubview(canvas)
         documentView = surface
+        canvas.onGeometryChange = { [weak self] in
+            self?.needsLayout = true
+            self?.layoutSubtreeIfNeeded()
+        }
+        canvas.onDragScroll = { [weak self] in self?.scrollWhileDragging(at: $0) }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:)") }
@@ -93,42 +104,82 @@ private final class ImageEditorScrollView: NSScrollView {
         guard let surface = documentView, contentSize.width > 0, contentSize.height > 0 else { return }
         let visible = contentView.bounds
         let padding: CGFloat = 24
-        let fitScale = min(max(1, visible.width - 2 * padding) / imageSize.width,
-                           max(1, visible.height - 2 * padding) / imageSize.height)
-        let scale = zoom ?? min(1, fitScale)
-        let size = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-        let documentSize = CGSize(width: max(visible.width, size.width + 2 * padding),
-                                  height: max(visible.height, size.height + 2 * padding))
-        let imageFrame = CGRect(x: (documentSize.width - size.width) / 2,
-                                y: (documentSize.height - size.height) / 2,
-                                width: size.width, height: size.height)
         let previous = imageView.frame
-        guard surface.frame.size != documentSize || previous != imageFrame else { return }
-        let x = previous.width > 0 ? (visible.midX - previous.minX) / previous.width : 0.5
-        let y = previous.height > 0 ? (visible.midY - previous.minY) / previous.height : 0.5
+        let artboard = canvas.contentBounds
+        let anchoredDrag = canvas.isDragging && previous.width > 0
+        let fitScale = min(max(1, visible.width - 2 * padding) / artboard.width,
+                           max(1, visible.height - 2 * padding) / artboard.height)
+        let scale = anchoredDrag ? canvas.scale : zoom ?? min(1, fitScale)
+        let size = CGSize(width: artboard.width * scale, height: artboard.height * scale)
+
+        let documentSize: CGSize
+        let canvasFrame: CGRect
+        let scrollOrigin: CGPoint
+        if anchoredDrag {
+            // Grow in document coordinates and shift the clip view by the same
+            // offset, keeping existing image pixels stationary under the pointer.
+            let frame = CGRect(x: previous.minX + artboard.minX * scale, y: previous.minY + artboard.minY * scale,
+                               width: size.width, height: size.height)
+            let document = frame.insetBy(dx: -padding, dy: -padding).union(visible)
+            documentSize = document.size
+            canvasFrame = frame.offsetBy(dx: -document.minX, dy: -document.minY)
+            scrollOrigin = CGPoint(x: visible.minX - document.minX, y: visible.minY - document.minY)
+        } else {
+            documentSize = CGSize(width: max(visible.width, size.width + 2 * padding),
+                                  height: max(visible.height, size.height + 2 * padding))
+            canvasFrame = CGRect(x: (documentSize.width - size.width) / 2, y: (documentSize.height - size.height) / 2,
+                                 width: size.width, height: size.height)
+            let oldScale = canvas.scale
+            let x = previous.width > 0 ? (visible.midX - previous.minX) / oldScale : artboard.midX
+            let y = previous.height > 0 ? (visible.midY - previous.minY) / oldScale : artboard.midY
+            scrollOrigin = CGPoint(x: canvasFrame.minX + (x - artboard.minX) * scale - visible.width / 2,
+                                   y: canvasFrame.minY + (y - artboard.minY) * scale - visible.height / 2)
+        }
+        let imageFrame = CGRect(x: canvasFrame.minX - artboard.minX * scale,
+                                y: canvasFrame.minY - artboard.minY * scale,
+                                width: imageSize.width * scale, height: imageSize.height * scale)
+        guard surface.frame.size != documentSize || previous != imageFrame || canvas.frame != canvasFrame else { return }
         surface.setFrameSize(documentSize)
         imageView.frame = imageFrame
-        canvas.frame = imageFrame
-        let center = CGPoint(x: imageFrame.minX + imageFrame.width * x,
-                             y: imageFrame.minY + imageFrame.height * y)
-        let proposed = CGRect(x: center.x - visible.width / 2, y: center.y - visible.height / 2,
-                              width: visible.width, height: visible.height)
+        canvas.place(frame: canvasFrame, artboard: artboard, scale: scale)
+        scroll(to: scrollOrigin)
+    }
+
+    private func scrollWhileDragging(at point: NSPoint) {
+        let visible = contentView.bounds
+        let location = contentView.convert(point, from: nil)
+        let edge: CGFloat = 24
+        func step(_ coordinate: CGFloat, lower: CGFloat, upper: CGFloat) -> CGFloat {
+            if coordinate < lower + edge { return max(-edge, coordinate - lower - edge) * 0.5 }
+            if coordinate > upper - edge { return min(edge, coordinate - upper + edge) * 0.5 }
+            return 0
+        }
+        scroll(to: CGPoint(x: visible.minX + step(location.x, lower: visible.minX, upper: visible.maxX),
+                           y: visible.minY + step(location.y, lower: visible.minY, upper: visible.maxY)))
+    }
+
+    private func scroll(to origin: CGPoint) {
+        let proposed = CGRect(origin: origin, size: contentView.bounds.size)
         contentView.scroll(to: contentView.constrainBoundsRect(proposed).origin)
         reflectScrolledClipView(contentView)
     }
 }
 
-final class ImageEditor: NSWindowController, NSWindowDelegate {
+final class ImageEditor: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
     private(set) var revision: UUID?
     let source: EditableImage
     let canvas: AnnotationCanvas
     private let scrollView: ImageEditorScrollView
     let saveButton = NSButton(title: "Сохранить", target: nil, action: nil)
-    private var toolButtons: [AnnotationToolbarButton] = []
-    private let shapesPicker = NSPopUpButton(frame: .zero, pullsDown: true)
-    private var selectedShape: AnnotationTool = .frame
+    private var groupButtons: [AnnotationToolbarButton] = []
+    private var variantGroups: [AnnotationTool.Group: AnnotationToolbarGroup] = [:]
+    private var variantButtons: [AnnotationToolbarButton] = []
+    private var recentTools: [AnnotationTool.Group: AnnotationTool] = [:]
     private var colorButtons: [AnnotationToolbarButton] = []
     private var widthButtons: [AnnotationToolbarButton] = []
+    private var widthGroup: AnnotationToolbarGroup?
+    private let fontSizePicker = NSComboBox()
+    private var fontSizeGroup: AnnotationToolbarGroup?
     private let zoomPicker = NSPopUpButton()
     private let undoButton = AnnotationToolbarButton(title: "", help: "Отменить (⌘Z)",
                                                        symbol: "arrow.uturn.backward", width: 25)
@@ -154,9 +205,6 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
         ("Белый", CGColor(gray: 1, alpha: 1)),
         ("Чёрный", CGColor(gray: 0.05, alpha: 1))
     ]
-    private let widths: [CGFloat] = [2, 4, 7]
-    private var widthScale: CGFloat { max(1, min(source.bounds.width, source.bounds.height) / 500) }
-
     init(entry: TrayEntry, source: EditableImage) {
         revision = entry.imageRevision
         hasShelfOnlyScreenshotEdits = entry.category == .screenshots && entry.imageRevision != nil && entry.screenshotSourcePath == nil
@@ -178,23 +226,33 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
         history.groupsByEvent = false
 
         configureControls()
-        var tools: [NSView] = toolButtons
-        tools.insert(shapesPicker, at: 1)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let toolbar = NSStackView(views: [
-            AnnotationToolbarGroup(controls: tools),
+            AnnotationToolbarGroup(controls: groupButtons),
             AnnotationToolbarGroup(controls: colorButtons, spacing: 1),
-            AnnotationToolbarGroup(controls: widthButtons, spacing: 1),
             AnnotationToolbarGroup(controls: [undoButton, redoButton]),
             spacer, zoomPicker, saveButton
         ])
         toolbar.alignment = .centerY
         toolbar.distribution = .fill
         toolbar.spacing = 6
+        let widths = AnnotationToolbarGroup(controls: widthButtons, spacing: 1)
+        widthGroup = widths
+        let fontSizeLabel = NSTextField(labelWithString: "Размер шрифта")
+        fontSizeLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        let fontSize = AnnotationToolbarGroup(controls: [fontSizeLabel, fontSizePicker], spacing: 8)
+        fontSize.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 6)
+        fontSizeGroup = fontSize
+        let options = NSStackView(views: AnnotationTool.Group.allCases.compactMap { variantGroups[$0] } + [widths, fontSize])
+        options.alignment = .centerY
+        options.spacing = 6
+        options.detachesHiddenViews = true
         let header = AnnotationToolbarBackground()
-        header.addSubview(toolbar)
-        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        for row in [toolbar, options] {
+            row.translatesAutoresizingMaskIntoConstraints = false
+            header.addSubview(row)
+        }
         let root = NSView()
         for view in [header, scrollView] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -204,10 +262,13 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
             header.topAnchor.constraint(equalTo: root.topAnchor),
             header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 56),
-            toolbar.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            header.heightAnchor.constraint(equalToConstant: 96),
+            toolbar.topAnchor.constraint(equalTo: header.topAnchor, constant: 5),
             toolbar.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 10),
             toolbar.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -10),
+            options.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 5),
+            options.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor),
+            options.trailingAnchor.constraint(lessThanOrEqualTo: toolbar.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -224,6 +285,7 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
                 self.window?.makeKeyAndOrderFront(nil)
                 self.window?.makeFirstResponder(self.canvas.preferredResponder)
             }
+        syncStyleButtons()
         updateState()
     }
 
@@ -239,26 +301,28 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
     }
 
     private func configureControls() {
-        toolButtons = [AnnotationTool.arrow, .pen, .text].map { tool in
-            let button = AnnotationToolbarButton(title: tool.title, help: tool.title,
-                                                  symbol: tool.symbol, width: tool == .arrow ? 74 : 58, isChoice: true)
-            button.tag = tool.rawValue
+        let groupIcons = ["arrow.up.right", "square.on.circle", "pencil.tip", "textformat"]
+        let groupWidths: [CGFloat] = [78, 74, 114, 58]
+        groupButtons = AnnotationTool.Group.allCases.map { group in
+            let button = AnnotationToolbarButton(title: group.title, help: group.title,
+                symbol: groupIcons[group.rawValue], width: groupWidths[group.rawValue], isChoice: true)
+            button.tag = group.rawValue
             button.target = self
-            button.action = #selector(chooseTool(_:))
+            button.action = #selector(chooseGroup(_:))
             return button
         }
-        shapesPicker.addItem(withTitle: "Фигуры")
-        for tool in AnnotationTool.shapes {
-            let item = NSMenuItem(title: tool.title, action: #selector(chooseShape(_:)), keyEquivalent: "")
-            item.tag = tool.rawValue
-            item.image = NSImage(systemSymbolName: tool.symbol, accessibilityDescription: nil)
-            item.target = self
-            shapesPicker.menu?.addItem(item)
+        for group in AnnotationTool.Group.allCases where group != .text {
+            let buttons = group.tools.map { tool in
+                let button = AnnotationToolbarButton(title: tool.title, help: tool.title, symbol: tool.symbol,
+                    width: tool == .doubleArrow || tool == .highlighter ? 115 : 93, isChoice: true)
+                button.tag = tool.rawValue
+                button.target = self
+                button.action = #selector(chooseVariant(_:))
+                return button
+            }
+            variantButtons += buttons
+            variantGroups[group] = AnnotationToolbarGroup(controls: buttons)
         }
-        shapesPicker.controlSize = .small
-        shapesPicker.font = .systemFont(ofSize: 12, weight: .medium)
-        shapesPicker.setAccessibilityLabel("Фигуры")
-        shapesPicker.widthAnchor.constraint(equalToConstant: 82).isActive = true
         colorButtons = colors.enumerated().map { index, color in
             let button = AnnotationToolbarButton(title: "", help: color.0, mark: .swatch(color.1),
                                                   width: 20, isChoice: true)
@@ -275,6 +339,19 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
             button.action = #selector(chooseWidth(_:))
             return button
         }
+        fontSizePicker.addItems(withObjectValues: AnnotationFontSize.presets.map(String.init))
+        fontSizePicker.numberOfVisibleItems = 8
+        fontSizePicker.isEditable = true
+        fontSizePicker.completes = false
+        fontSizePicker.controlSize = .small
+        fontSizePicker.font = .systemFont(ofSize: 12, weight: .medium)
+        fontSizePicker.toolTip = "Размер шрифта от 6 до 512 пикселей"
+        fontSizePicker.setAccessibilityLabel("Размер шрифта")
+        fontSizePicker.translatesAutoresizingMaskIntoConstraints = false
+        fontSizePicker.widthAnchor.constraint(equalToConstant: 78).isActive = true
+        fontSizePicker.delegate = self
+        fontSizePicker.target = self
+        fontSizePicker.action = #selector(chooseFontSize(_:))
         zoomPicker.addItems(withTitles: ["Вписать", "50 %", "100 %", "200 %"])
         zoomPicker.controlSize = .small
         zoomPicker.font = .systemFont(ofSize: 12, weight: .medium)
@@ -296,22 +373,23 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
         saveButton.keyEquivalent = "s"
         saveButton.keyEquivalentModifierMask = .command
         saveButton.widthAnchor.constraint(equalToConstant: 99).isActive = true
-        canvas.setStyle(color: colors[0].1, width: widths[1] * widthScale)
-        syncStyleButtons()
+        canvas.setStyle(color: colors[0].1)
     }
 
-    @objc private func chooseTool(_ sender: NSButton) {
+    @objc private func chooseGroup(_ sender: NSButton) {
+        guard let group = AnnotationTool.Group(rawValue: sender.tag) else { return }
+        activateTool(recentTools[group] ?? group.tools[0])
+    }
+
+    @objc private func chooseVariant(_ sender: NSButton) {
         guard let tool = AnnotationTool(rawValue: sender.tag) else { return }
-        canvas.tool = tool
-        syncStyleButtons()
-        window?.makeFirstResponder(canvas)
+        activateTool(tool)
     }
 
-    @objc private func chooseShape(_ item: NSMenuItem) {
-        guard let tool = AnnotationTool(rawValue: item.tag), AnnotationTool.shapes.contains(tool) else { return }
-        selectedShape = tool
+    private func activateTool(_ tool: AnnotationTool) {
+        finishFontSizeEntry()
+        recentTools[tool.group] = tool
         canvas.tool = tool
-        syncStyleButtons()
         window?.makeFirstResponder(canvas)
     }
 
@@ -321,26 +399,65 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func chooseWidth(_ sender: NSButton) {
-        canvas.setStyle(width: widths[sender.tag] * widthScale)
+        let widths = canvas.styleTool.widthOptions
+        guard widths.indices.contains(sender.tag) else { return }
+        canvas.setStyle(width: widths[sender.tag] * canvas.widthScale)
         window?.makeFirstResponder(canvas.preferredResponder)
     }
 
-    private func syncStyleButtons() {
-        for button in toolButtons { button.selected = button.tag == canvas.tool.rawValue }
-        let shapeActive = AnnotationTool.shapes.contains(canvas.tool)
-        if shapeActive { selectedShape = canvas.tool }
-        shapesPicker.contentTintColor = shapeActive ? .controlAccentColor : nil
-        shapesPicker.toolTip = "Фигуры — " + selectedShape.title
-        for item in shapesPicker.itemArray.dropFirst() {
-            item.state = item.tag == selectedShape.rawValue ? .on : .off
+    @objc private func chooseFontSize(_ sender: NSComboBox) {
+        applyFontSize(sender.stringValue)
+        window?.makeFirstResponder(canvas.preferredResponder)
+    }
+
+    func comboBoxSelectionDidChange(_ notification: Notification) {
+        guard let value = fontSizePicker.objectValueOfSelectedItem as? String else { return }
+        applyFontSize(value)
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        applyFontSize(fontSizePicker.stringValue)
+    }
+
+    private func applyFontSize(_ value: String) {
+        guard canvas.styleTool == .text, !isSaving else { return }
+        if let size = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+           AnnotationFontSize.range.contains(size), CGFloat(size) != canvas.styleWidth {
+            canvas.setStyle(width: CGFloat(size))
         }
+        syncFontSize()
+    }
+
+    private func syncFontSize() {
+        fontSizePicker.stringValue = String(Int(canvas.styleWidth))
+    }
+
+    private func finishFontSizeEntry() {
+        if fontSizePicker.currentEditor() != nil {
+            window?.makeFirstResponder(canvas.preferredResponder)
+        }
+    }
+
+    private func syncStyleButtons() {
+        let tool = canvas.styleTool
+        for button in groupButtons { button.selected = button.tag == tool.group.rawValue }
+        for (group, view) in variantGroups { view.isHidden = group != tool.group }
+        for button in variantButtons { button.selected = button.tag == tool.rawValue }
         for button in colorButtons { button.selected = colors[button.tag].1 == canvas.styleColor }
-        for button in widthButtons { button.selected = widths[button.tag] * widthScale == canvas.styleWidth }
+        let widths = tool.widthOptions
+        widthGroup?.isHidden = widths.isEmpty
+        fontSizeGroup?.isHidden = tool != .text
+        if tool == .text, fontSizePicker.currentEditor() == nil { syncFontSize() }
+        for button in widthButtons {
+            let index = button.tag
+            button.selected = widths.indices.contains(index) && widths[index] * canvas.widthScale == canvas.styleWidth
+        }
     }
 
     @objc private func chooseZoom() {
         let zooms: [CGFloat?] = [nil, 0.5, 1, 2]
         guard zooms.indices.contains(zoomPicker.indexOfSelectedItem) else { return }
+        finishFontSizeEntry()
         canvas.resetSelection()
         scrollView.zoom = zooms[zoomPicker.indexOfSelectedItem]
         window?.makeFirstResponder(canvas.preferredResponder)
@@ -364,8 +481,8 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
         let pendingText = canvas.annotationsIncludingText != canvas.annotations
         undoButton.isEnabled = (history.canUndo || pendingText) && !isSaving
         redoButton.isEnabled = history.canRedo && !pendingText && !isSaving
-        for button in toolButtons + colorButtons + widthButtons { button.isEnabled = !isSaving }
-        shapesPicker.isEnabled = !isSaving
+        for button in groupButtons + variantButtons + colorButtons + widthButtons { button.isEnabled = !isSaving }
+        fontSizePicker.isEnabled = !isSaving
         zoomPicker.isEnabled = !isSaving
         window?.isDocumentEdited = hasChanges
     }
@@ -374,6 +491,7 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
 
     @objc func undo(_ sender: Any?) {
         guard !isSaving else { return }
+        finishFontSizeEntry()
         canvas.finishText()
         canvas.resetSelection()
         history.undo()
@@ -382,6 +500,7 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
 
     @objc func redo(_ sender: Any?) {
         guard !isSaving else { return }
+        finishFontSizeEntry()
         canvas.finishText()
         canvas.resetSelection()
         history.redo()
@@ -396,6 +515,7 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
 
     func save(completion: ((Bool) -> Void)? = nil) {
         guard !isSaving else { completion?(false); return }
+        finishFontSizeEntry()
         canvas.finishText()
         guard hasChanges || hasShelfOnlyScreenshotEdits else { completion?(true); return }
         canvas.resetSelection()
@@ -444,6 +564,7 @@ final class ImageEditor: NSWindowController, NSWindowDelegate {
     }
     func requestClose(completion: @escaping (Bool) -> Void) {
         guard !isSaving, !isConfirmingClose, let window, window.attachedSheet == nil else { completion(false); return }
+        finishFontSizeEntry()
         canvas.finishText()
         guard hasChanges else { closeAfterConfirmation(); completion(true); return }
         isConfirmingClose = true

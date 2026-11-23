@@ -470,6 +470,8 @@ final class ShelfView: DropSurface {
         guard let controller else { return }
         let screenshots = controller.activeSection == .screenshots
         let activity = controller.busy > 0 || controller.hasError
+        addButton.isHidden = screenshots
+        toolbarDivider.isHidden = screenshots
         subtitle.stringValue = activity ? controller.statusText : (screenshots ? controller.screenshotStatusText : "")
         subtitle.toolTip = subtitle.stringValue.isEmpty ? nil : subtitle.stringValue
         subtitle.textColor = controller.hasError ? .systemOrange : .secondaryLabelColor
@@ -586,7 +588,8 @@ final class ShelfView: DropSurface {
         addButton.frame = NSRect(x: width - 83, y: toolbarY, width: 28, height: 28)
         menuButton.frame = NSRect(x: width - 49, y: toolbarY, width: 28, height: 28)
         let statusX: CGFloat = compact ? 184 : 242
-        subtitle.frame = NSRect(x: statusX, y: toolbarY + 6, width: max(0, width - statusX - 106), height: 16)
+        let statusTrailing: CGFloat = addButton.isHidden ? 60 : 106
+        subtitle.frame = NSRect(x: statusX, y: toolbarY + 6, width: max(0, width - statusX - statusTrailing), height: 16)
         spinner.frame = NSRect(x: compact ? 164 : 222, y: toolbarY + 6, width: 14, height: 14)
         pageViewport.frame = NSRect(x: 0, y: top, width: width, height: toolbarY - top - 8)
         renderSectionPosition()

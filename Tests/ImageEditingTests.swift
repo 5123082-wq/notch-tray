@@ -61,13 +61,49 @@ struct ImageEditingTests {
             rendered.colorAt(x: 40, y: 60)!.greenComponent > 0.9)
         try check("Markup export retains full resolution and alpha", rendered.pixelsWide == 120 && rendered.pixelsHigh == 80 && rendered.colorAt(x: 110, y: 70)!.alphaComponent < 0.01)
         try editedPNG.write(to: output.appendingPathComponent("annotation-arrow-export.png"))
-        let text = ImageAnnotation(shape: .text("Снимок", CGPoint(x: 15, y: 30)), color: arrow.color, width: 4)
+        let text = ImageAnnotation(shape: .text("Снимок", CGPoint(x: 15, y: 30)), color: arrow.color, width: 20)
         let pen = ImageAnnotation(shape: .pen([CGPoint(x: 72, y: 59), CGPoint(x: 64, y: 61), CGPoint(x: 53, y: 59)]),
                                   color: arrow.color, width: 4)
         let notes = NSBitmapImageRep(data: try source.png(annotations: [text, pen]))!
         try check("Text and pen strokes are included in the full-resolution export",
             (30..<54).contains { y in (15..<75).contains { x in notes.colorAt(x: x, y: y)!.greenComponent < 0.6 } } &&
                 notes.colorAt(x: 64, y: 61)!.greenComponent < 0.1)
+
+        let overflow = ImageAnnotation(shape: .line(CGPoint(x: -10, y: -8), CGPoint(x: 130, y: 90)),
+                                       color: arrow.color, width: 4)
+        let expandedBounds = AnnotationArtboard.bounds(for: source.bounds, annotations: [overflow])
+        let expanded = NSBitmapImageRep(data: try source.png(annotations: [overflow]))!
+        let margin = expanded.colorAt(x: 0, y: expanded.pixelsHigh - 1)!.usingColorSpace(.sRGB)!
+        try check("Export grows in all directions to the stroke bounds",
+            expandedBounds == CGRect(x: -12, y: -10, width: 144, height: 102) &&
+            expanded.pixelsWide == 144 && expanded.pixelsHigh == 102)
+        try check("Expanded export keeps the source aligned and paints only the margins",
+            abs(margin.redComponent - 230.0 / 255) < 0.02 && abs(margin.greenComponent - margin.redComponent) < 0.02 &&
+            expanded.colorAt(x: 14, y: 18)!.redComponent < 0.1 && expanded.colorAt(x: 14, y: 18)!.blueComponent > 0.9 &&
+            expanded.colorAt(x: 122, y: 80)!.alphaComponent < 0.01)
+        let outsideLabel = ImageAnnotation(shape: .text("Строка", CGPoint(x: 115, y: 78)), color: arrow.color, width: 20)
+        let labelBounds = AnnotationArtboard.bounds(for: source.bounds, annotations: [outsideLabel])
+        try check("Text participates in canvas growth along its right and bottom edges",
+            labelBounds.maxX > 120 && labelBounds.maxY > 80)
+        let tooWide = overflow.moved(by: CGPoint(x: 80_000_000, y: 0))
+        do {
+            _ = try source.png(annotations: [tooWide])
+            throw ImageEditError.renderFailed
+        } catch ImageEditError.tooLarge {
+            try check("Oversized artboards are rejected before allocating a bitmap", true)
+        }
+        let flatStroke = ImageAnnotation(shape: .pen([CGPoint(x: 5, y: 9), CGPoint(x: 35, y: 9)]),
+                                        color: arrow.color, width: 4)
+        let widerFlatStroke = flatStroke.resized(at: .frame(x: .maximum, y: .maximum),
+                                               by: CGPoint(x: 15, y: 7), minimumSize: 3)
+        try check("Resizing an exactly horizontal stroke stretches its usable axis without introducing invalid geometry",
+            widerFlatStroke.shape == .pen([CGPoint(x: 5, y: 9), CGPoint(x: 50, y: 9)]) &&
+            widerFlatStroke.handles.count == 8 && widerFlatStroke.width == flatStroke.width)
+        let highlight = ImageAnnotation(shape: .pen([CGPoint(x: 28, y: 24), CGPoint(x: 90, y: 24)], style: .highlighter),
+                                        color: arrow.color, width: 18)
+        let highlighted = NSBitmapImageRep(data: try source.png(annotations: [highlight]))!
+        try check("Highlighter leaves the base visible through its stroke",
+            (0.50...0.74).contains(highlighted.colorAt(x: 45, y: 24)!.greenComponent))
 
         let jpeg = NSMutableData()
         let jpgDestination = CGImageDestinationCreateWithData(jpeg, UTType.jpeg.identifier as CFString, 1, nil)!
@@ -159,7 +195,7 @@ struct ImageEditingTests {
         }
         ignorePhysicalPointerEvents(controller)
         func pointer(_ type: NSEvent.EventType, in canvas: AnnotationCanvas, at point: CGPoint, clicks: Int = 1) {
-            let location = canvas.convert(CGPoint(x: point.x * canvas.scale, y: point.y * canvas.scale), to: nil)
+            let location = canvas.convert(canvas.viewPoint(for: point), to: nil)
             let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
                 timestamp: 0, windowNumber: canvas.window!.windowNumber, context: nil,
                 eventNumber: 0, clickCount: clicks, pressure: 1)!
@@ -187,16 +223,23 @@ struct ImageEditingTests {
             view.subviews.flatMap { [$0] + descendants(of: $0) }
         }
         let editorContent = editor.window!.contentView!
-        let controls = descendants(of: editorContent)
-        let buttons = controls.compactMap { $0 as? AnnotationToolbarButton }
-        let arrowButton = buttons.first { $0.title == "Стрелка" }!
-        let textButton = buttons.first { $0.title == "Текст" }!
-        let blueButton = buttons.first { $0.toolTip == "Синий" }!
-        let pickers = controls.compactMap { $0 as? NSPopUpButton }
-        let shapes = pickers.first { $0.itemTitles.first == "Фигуры" }!
-        let zoom = pickers.first { $0 !== shapes }!
+        func visibleButtons() -> [AnnotationToolbarButton] {
+            descendants(of: editorContent).compactMap { $0 as? AnnotationToolbarButton }
+                .filter { !$0.isHiddenOrHasHiddenAncestor }
+        }
+        func button(_ title: String) -> AnnotationToolbarButton {
+            editorContent.layoutSubtreeIfNeeded()
+            return visibleButtons().first { $0.toolTip == title }!
+        }
+        let arrowButton = button("Стрелки")
+        let textButton = button("Текст")
+        let blueButton = button("Синий")
+        let shapesButton = button("Фигуры")
+        let freehandButton = button("Линии от руки")
+        let zoom = descendants(of: editorContent).compactMap { $0 as? NSPopUpButton }.first!
         func chooseShape(_ tool: AnnotationTool) {
-            shapes.menu!.performActionForItem(at: shapes.indexOfItem(withTitle: tool.title))
+            shapesButton.performClick(nil)
+            button(tool.title).performClick(nil)
         }
         func drag(from: CGPoint, to: CGPoint) {
             pointer(.mouseMoved, in: canvas, at: from)
@@ -209,7 +252,10 @@ struct ImageEditingTests {
             zoom.sendAction(zoom.action!, to: zoom.target)
             editorContent.layoutSubtreeIfNeeded()
         }
-        try check("Shapes offers frame, circle and straight line", Array(shapes.itemTitles.dropFirst()) == ["Рамка", "Круг", "Линия"])
+        shapesButton.performClick(nil)
+        editorContent.layoutSubtreeIfNeeded()
+        try check("The lower row offers frame, circle and straight line",
+            AnnotationTool.Group.shapes.tools.allSatisfy { tool in visibleButtons().contains { $0.title == tool.title } })
         chooseShape(.circle)
         drag(from: CGPoint(x: 87, y: 65), to: CGPoint(x: 29, y: 25))
         guard let circle = canvas.annotations.first else { throw ImageEditError.renderFailed }
@@ -234,6 +280,77 @@ struct ImageEditingTests {
         for _ in 0..<4 { editor.undo(nil) }
         try check("Shape gestures undo independently", !editor.hasChanges)
 
+        arrowButton.performClick(nil)
+        for (tool, style) in [(AnnotationTool.openArrow, ImageAnnotation.ArrowStyle.open), (.doubleArrow, .double)] {
+            button(tool.title).performClick(nil)
+            drag(from: CGPoint(x: 18, y: 22), to: CGPoint(x: 76, y: 38))
+            try check("\(tool.title) is drawn as a separate arrow style with two editable endpoints",
+                canvas.annotations.last?.shape == .arrow(CGPoint(x: 18, y: 22), CGPoint(x: 76, y: 38), style: style) &&
+                canvas.annotations.last?.handles.count == 2)
+            editor.undo(nil)
+        }
+        freehandButton.performClick(nil)
+        arrowButton.performClick(nil)
+        try check("Returning to Arrows remembers the last variant", canvas.tool == .doubleArrow)
+        button(AnnotationTool.arrow.title).performClick(nil)
+
+        for tool in AnnotationTool.Group.freehand.tools {
+            freehandButton.performClick(nil)
+            button(tool.title).performClick(nil)
+            editorContent.layoutSubtreeIfNeeded()
+            try check("\(tool.title) exposes the correct width controls",
+                visibleButtons().contains { $0.toolTip == "Тонкая линия" } == (tool != .marker))
+            let start = CGPoint(x: 18, y: 24)
+            let bend = CGPoint(x: 44, y: 48)
+            let end = CGPoint(x: 78, y: 25)
+            pointer(.leftMouseDown, in: canvas, at: start)
+            pointer(.leftMouseDragged, in: canvas, at: bend)
+            pointer(.leftMouseUp, in: canvas, at: end)
+            guard let stroke = canvas.annotations.last, stroke.handles.count == 8,
+                  let right = stroke.handles.first(where: { $0.kind == .frame(x: .maximum, y: .middle) })?.point else {
+                throw ImageEditError.renderFailed
+            }
+            try check("\(tool.title) draws and gets eight resize handles", stroke.tool == tool)
+            // Locate a point on the stroke away from handles, including for the widest tool.
+            let shaft = CGPoint(x: 31, y: 36)
+            drag(from: shaft, to: CGPoint(x: 35, y: 39))
+            guard let shifted = canvas.annotations.last else { throw ImageEditError.renderFailed }
+            try check("\(tool.title) moves as a single stroke", shifted == stroke.moved(by: CGPoint(x: 4, y: 3)))
+            editor.undo(nil)
+            drag(from: right, to: CGPoint(x: right.x + 15, y: right.y + 3))
+            guard let stretched = canvas.annotations.last else { throw ImageEditError.renderFailed }
+            try check("\(tool.title) stretches horizontally and keeps its width and vertical bounds",
+                stretched.bounds.width > stroke.bounds.width + 10 && stretched.width == stroke.width &&
+                abs(stretched.bounds.height - stroke.bounds.height) < 0.001)
+            editor.undo(nil)
+            editor.redo(nil)
+            try check("\(tool.title) redo restores its resize", canvas.annotations == [stretched])
+            editor.undo(nil)
+            editor.undo(nil)
+        }
+        try check("Freehand drawing and resizing leave the editor clean after undo", !editor.hasChanges)
+
+        for (zoomIndex, end) in [(0, CGPoint(x: -20, y: -12)), (3, CGPoint(x: 138, y: 96))] {
+            setZoom(zoomIndex)
+            arrowButton.performClick(nil)
+            let start = CGPoint(x: 64, y: 42)
+            let before = canvas.convert(canvas.viewPoint(for: start), to: nil)
+            let oldScale = canvas.scale
+            pointer(.leftMouseDown, in: canvas, at: start)
+            pointer(.leftMouseDragged, in: canvas, at: end)
+            let after = canvas.convert(canvas.viewPoint(for: start), to: nil)
+            try check("Live growth at zoom \(zoomIndex) preserves the image anchor and the scale",
+                canvas.scale == oldScale && hypot(before.x - after.x, before.y - after.y) < 1 &&
+                canvas.contentBounds != source.bounds && !editor.hasChanges)
+            pointer(.leftMouseUp, in: canvas, at: end)
+            let exported = NSBitmapImageRep(data: try source.png(annotations: canvas.annotations))!
+            try check("Expanded export agrees with the editor at zoom \(zoomIndex)",
+                exported.pixelsWide == Int(canvas.contentBounds.width) &&
+                exported.pixelsHigh == Int(canvas.contentBounds.height) && canvas.annotations.count == 1)
+            editor.undo(nil)
+            try check("Undo shrinks the expanded artboard back to the screenshot", canvas.contentBounds == source.bounds)
+        }
+        setZoom(0)
         let anchor = CGPoint(x: 8, y: 2)
         textButton.performClick(nil)
         pointer(.leftMouseDown, in: canvas, at: anchor)
@@ -252,7 +369,7 @@ struct ImageEditingTests {
         input.insertText("Б", replacementRange: input.selectedRange())
         try check("Return inserts newlines at the caret and enables Save while typing",
             input.string == "Абвгд\n\nБ" && editor.window!.firstResponder === input && editor.saveButton.isEnabled)
-        let typedSize = AnnotationTextLayout(input.string, width: canvas.styleWidth, color: canvas.styleColor).size
+        let typedSize = AnnotationTextLayout(input.string, fontSize: canvas.styleWidth, color: canvas.styleColor).size
         try check("The multiline input fits its visible text, including space for the caret",
             typedSize.width > 45 && input.bounds.width == typedSize.width + 3 && input.bounds.height == typedSize.height)
         setZoom(3)
@@ -279,6 +396,67 @@ struct ImageEditingTests {
             canvas.annotations == [typed] && editor.window!.firstResponder === canvas)
         editor.undo(nil)
         try check("One annotation undo removes the complete multiline label", !editor.hasChanges && canvas.annotations.isEmpty)
+
+        textButton.performClick(nil)
+        editorContent.layoutSubtreeIfNeeded()
+        guard let fontSize = descendants(of: editorContent).compactMap({ $0 as? NSComboBox }).first else {
+            throw ImageEditError.renderFailed
+        }
+        try check("Text offers an editable size field and several presets in the lower toolbar",
+            fontSize.isEditable && fontSize.stringValue == "20" && fontSize.numberOfItems > 3 &&
+            !fontSize.isHiddenOrHasHiddenAncestor && !visibleButtons().contains { $0.toolTip == "Тонкая линия" })
+        let labelAnchor = CGPoint(x: 25, y: 9)
+        let label = "АБ\nВ"
+        pointer(.leftMouseDown, in: canvas, at: labelAnchor)
+        guard let liveText = editor.window!.firstResponder as? NSTextView else { throw ImageEditError.renderFailed }
+        liveText.insertText(label, replacementRange: liveText.selectedRange())
+        fontSize.selectItem(withObjectValue: "24")
+        try check("Selecting a preset updates the active paragraph at 24 image pixels",
+            liveText.font?.pointSize == 24 && canvas.annotationsIncludingText.last?.width == 24)
+        func enterFontSize(_ value: String) throws {
+            guard editor.window!.makeFirstResponder(fontSize),
+                  let field = fontSize.currentEditor() as? NSTextView else { throw ImageEditError.renderFailed }
+            field.insertText(value, replacementRange: NSRange(location: 0, length: (field.string as NSString).length))
+            pressReturn(in: field)
+        }
+        try enterFontSize("27")
+        try check("Typing a custom size applies it without ending the active text edit",
+            editor.window!.firstResponder === liveText && liveText.font?.pointSize == 27 &&
+            canvas.annotationsIncludingText.last?.width == 27 && fontSize.stringValue == "27")
+        try enterFontSize("900")
+        try check("An out-of-range entry restores the current valid size",
+            editor.window!.firstResponder === liveText && liveText.font?.pointSize == 27 && fontSize.stringValue == "27")
+        arrowButton.performClick(nil)
+        guard let originalLabel = canvas.annotations.last else { throw ImageEditError.renderFailed }
+        try check("The annotation retains its exact font size and eight handles",
+            originalLabel.shape == .text(label, labelAnchor) && originalLabel.width == 27 && originalLabel.handles.count == 8)
+        let bottomRight = CGPoint(x: originalLabel.bounds.maxX, y: originalLabel.bounds.maxY)
+        let resizeTarget = CGPoint(x: bottomRight.x + originalLabel.bounds.width * 0.52,
+                                   y: bottomRight.y + originalLabel.bounds.height * 0.52)
+        pointer(.leftMouseDown, in: canvas, at: bottomRight)
+        pointer(.leftMouseDragged, in: canvas, at: resizeTarget)
+        guard let previewLabel = canvas.editingPreview else { throw ImageEditError.renderFailed }
+        try check("A corner handle previews proportional text enlargement and updates the size field",
+            previewLabel.width == 41 && previewLabel.shape == .text(label, labelAnchor) &&
+            fontSize.stringValue == "41" && canvas.annotations == [originalLabel])
+        pointer(.leftMouseUp, in: canvas, at: resizeTarget)
+        try check("Releasing a text handle commits the preview and grows the artboard when needed",
+            canvas.annotations == [previewLabel] && canvas.contentBounds.maxY > source.bounds.maxY)
+        editor.undo(nil)
+        try check("One undo restores the prior font size and artboard", canvas.annotations == [originalLabel] &&
+            canvas.contentBounds == source.bounds)
+        editor.redo(nil)
+        let leftEdge = CGPoint(x: previewLabel.bounds.minX, y: previewLabel.bounds.midY)
+        drag(from: leftEdge, to: CGPoint(x: leftEdge.x + previewLabel.bounds.width / 4, y: leftEdge.y + 7))
+        guard let smaller = canvas.annotations.last else { throw ImageEditError.renderFailed }
+        try check("A side handle shrinks glyphs uniformly and anchors the opposing midpoint",
+            smaller.width == 31 && smaller.bounds.maxX == previewLabel.bounds.maxX &&
+            smaller.bounds.midY == previewLabel.bounds.midY)
+        for _ in 0..<3 { editor.undo(nil) }
+        try check("Undoing both sizes and the text creation returns to a clean document", !editor.hasChanges)
+        textButton.performClick(nil)
+        try enterFontSize("20")
+
         textButton.performClick(nil)
         pointer(.leftMouseDown, in: canvas, at: anchor)
         guard let firstLabel = editor.window!.firstResponder as? NSTextView else { throw ImageEditError.renderFailed }
@@ -319,14 +497,19 @@ struct ImageEditingTests {
 
         editor.window!.setContentSize(editor.window!.contentMinSize)
         editorContent.layoutSubtreeIfNeeded()
-        try check("All grouped toolbar controls remain visible at the minimum window size",
-            editorContent.bounds.width <= 801 && buttons.count == 14 && (buttons + pickers + [editor.saveButton]).allSatisfy {
-                !$0.isHiddenOrHasHiddenAncestor && editorContent.bounds.insetBy(dx: -1, dy: -1)
-                    .contains($0.convert($0.bounds, to: editorContent)) && !$0.visibleRect.isEmpty
-            })
+        for group in [arrowButton, shapesButton, freehandButton, textButton] {
+            group.performClick(nil)
+            editorContent.layoutSubtreeIfNeeded()
+            let controls: [NSView] = visibleButtons()
+            try check("\(group.title) remains usable at the minimum window size",
+                editorContent.bounds.width <= 801 && (controls + [zoom, editor.saveButton]).allSatisfy {
+                    editorContent.bounds.insetBy(dx: -1, dy: -1)
+                        .contains($0.convert($0.bounds, to: editorContent)) && !$0.visibleRect.isEmpty
+                })
+        }
         chooseShape(.frame)
         try check("The toolbar selects Frame and keeps the selected state visible",
-            shapes.item(withTitle: "Рамка")?.state == .on && !arrowButton.selected && canvas.tool == .frame)
+            button("Рамка").selected && !arrowButton.selected && canvas.tool == .frame)
         let initialAnnotations = canvas.annotations
         let tipNear = CGPoint(x: 24, y: 44)
         let tipRelease = CGPoint(x: 19, y: 39)

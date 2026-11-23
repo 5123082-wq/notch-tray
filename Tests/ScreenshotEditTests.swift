@@ -16,11 +16,11 @@ struct ScreenshotEditTests {
             guard try test() else { fatalError(label) }
             print("PASS: \(label)")
         }
-        func image(_ type: UTType, white: CGFloat) -> Data {
-            let bitmap = CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 256,
+        func image(_ type: UTType, white: CGFloat, width: Int = 64, height: Int = 64) -> Data {
+            let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
                                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
             bitmap.setFillColor(CGColor(gray: white, alpha: 1))
-            bitmap.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+            bitmap.fill(CGRect(x: 0, y: 0, width: width, height: height))
             let result = NSMutableData()
             let dest = CGImageDestinationCreateWithData(result, type.identifier as CFString, 1, nil)!
             CGImageDestinationAddImage(dest, bitmap.makeImage()!, nil)
@@ -28,6 +28,7 @@ struct ScreenshotEditTests {
             return result as Data
         }
         let editedPNG = image(.png, white: 1)
+        let expandedPNG = image(.png, white: 0.9, width: 80, height: 72)
         let sourcePNG = image(.png, white: 0)
         let root = base.appendingPathComponent("shelf")
         let store = try TrayStorage(root: root)
@@ -45,6 +46,14 @@ struct ScreenshotEditTests {
                       saved.name == original.lastPathComponent && CGImageSourceGetType(output) as String? == type.identifier &&
                       CGImageSourceCreateImageAtIndex(output, 0, nil)?.width == 64 && bytes != originalBytes &&
                       (try Data(contentsOf: store.url(for: saved))) == bytes)
+            let expanded = try store.saveEditedImage(expandedPNG, for: card.id, expectedRevision: saved.imageRevision)
+            let expandedSource = CGImageSourceCreateWithURL(original as CFURL, nil)!
+            let pixels = CGImageSourceCreateImageAtIndex(expandedSource, 0, nil)
+            try check("\(type.identifier) publishes the expanded dimensions on the same card and original URL",
+                      expanded.id == card.id && expanded.name == original.lastPathComponent &&
+                      CGImageSourceGetType(expandedSource) as String? == type.identifier &&
+                      pixels?.width == 80 && pixels?.height == 72 &&
+                      (try Data(contentsOf: store.url(for: expanded))) == Data(contentsOf: original))
         }
         try check("Four saves leave exactly four files in the original folder", try fm.contentsOfDirectory(atPath: folder.path).count == 4)
 
